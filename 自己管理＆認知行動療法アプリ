@@ -1,0 +1,762 @@
+import { useState, useEffect } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInWithCustomToken, onAuthStateChanged, signInAnonymously } from 'firebase/auth';
+import { getFirestore, collection, addDoc, onSnapshot, query, deleteDoc, doc } from 'firebase/firestore';
+import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
+
+// Tailwind CSS is assumed to be available
+const firebaseConfig = typeof __firebase_config !== 'undefined' && __firebase_config ? JSON.parse(__firebase_config) : {};
+const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+
+// Helper function to format date
+const formatDate = (timestamp) => {
+    if (!timestamp) return '';
+    const date = timestamp.toDate ? timestamp.toDate() : new Date(timestamp);
+    return date.toLocaleDateString('ja-JP', { year: 'numeric', month: 'long', day: 'numeric', weekday: 'short' });
+};
+
+// Main App component
+export default function App() {
+    // State variables for Firebase, user, and data
+    const [db, setDb] = useState(null);
+    const [auth, setAuth] = useState(null);
+    const [userId, setUserId] = useState(null);
+    const [entries, setEntries] = useState([]);
+    const [loading, setLoading] = useState(true);
+    const [currentView, setCurrentView] = useState('home'); // 'home', 'journal', 'dashboard', 'analytics'
+
+    // Form state for new journal entry
+    const [situation, setSituation] = useState('');
+    const [mood, setMood] = useState('');
+    const [rating, setRating] = useState(3); // 5-point rating, default to 3
+    const [negativeThought, setNegativeThought] = useState('');
+    const [evidenceFor, setEvidenceFor] = useState('');
+    [evidenceAgainst, setEvidenceAgainst] = useState('');
+    const [balancedThought, setBalancedThought] = useState('');
+    const [formLoading, setFormLoading] = useState(false);
+    const [apiLoading, setApiLoading] = useState(false);
+    const [analysisLoading, setAnalysisLoading] = useState(false);
+    const [message, setMessage] = useState('');
+    const [moodSuggestions, setMoodSuggestions] = useState([]);
+    const [customFields, setCustomFields] = useState([]);
+    const [customSuggestions, setCustomSuggestions] = useState({});
+    
+    // State for Gemini API responses
+    const [generatedBalancedThought, setGeneratedBalancedThought] = useState('');
+    const [summaryResult, setSummaryResult] = useState('');
+
+    // Initialize Firebase and handle authentication
+    useEffect(() => {
+        if (!firebaseConfig.projectId) {
+            console.error("Firebase config is missing. Please check the environment variables.");
+            setLoading(false);
+            return;
+        }
+
+        const app = initializeApp(firebaseConfig);
+        const authInstance = getAuth(app);
+        const dbInstance = getFirestore(app);
+
+        setAuth(authInstance);
+        setDb(dbInstance);
+
+        const unsubscribe = onAuthStateChanged(authInstance, async (user) => {
+            if (user) {
+                setUserId(user.uid);
+            } else {
+                if (initialAuthToken) {
+                    try {
+                        await signInWithCustomToken(authInstance, initialAuthToken);
+                    } catch (error) {
+                        console.error("Custom token sign-in failed:", error);
+                        await signInAnonymously(authInstance);
+                    }
+                } else {
+                    await signInAnonymously(authInstance);
+                }
+            }
+        });
+        
+        // --- PWA Service Worker Registration ---
+        if ('serviceWorker' in navigator) {
+            window.addEventListener('load', () => {
+                navigator.serviceWorker.register('/service-worker.js')
+                    .then(registration => {
+                        console.log('Service Worker registered with scope:', registration.scope);
+                    })
+                    .catch(error => {
+                        console.error('Service Worker registration failed:', error);
+                    });
+            });
+        }
+        // --- End PWA Service Worker Registration ---
+
+        return () => unsubscribe();
+    }, []);
+
+    // Fetch data from Firestore when the user ID is available
+    useEffect(() => {
+        if (db && userId) {
+            setLoading(true);
+            const entriesRef = collection(db, `artifacts/${appId}/users/${userId}/cbtEntries`);
+            const q = query(entriesRef);
+
+            const unsubscribe = onSnapshot(q, (querySnapshot) => {
+                const fetchedEntries = [];
+                querySnapshot.forEach((doc) => {
+                    fetchedEntries.push({ id: doc.id, ...doc.data() });
+                });
+                fetchedEntries.sort((a, b) => b.timestamp - a.timestamp);
+                setEntries(fetchedEntries);
+                setLoading(false);
+                
+                const moods = [...new Set(fetchedEntries.map(e => e.mood).filter(Boolean))];
+                setMoodSuggestions(moods);
+
+                const customFieldSuggestions = fetchedEntries.reduce((acc, entry) => {
+                    Object.entries(entry).forEach(([key, value]) => {
+                        if (key.startsWith('custom_') && value) {
+                            const fieldName = key.replace('custom_', '');
+                            if (!acc[fieldName]) {
+                                acc[fieldName] = new Set();
+                            }
+                            acc[fieldName].add(value);
+                        }
+                    });
+                    return acc;
+                }, {});
+
+                setCustomSuggestions(
+                    Object.fromEntries(
+                        Object.entries(customFieldSuggestions).map(([key, value]) => [key, Array.from(value)])
+                    )
+                );
+            }, (error) => {
+                console.error("Failed to fetch entries:", error);
+                setLoading(false);
+            });
+
+            return () => unsubscribe();
+        }
+    }, [db, userId]);
+
+    // Handle form submission
+    const handleSubmit = async (e) => {
+        e.preventDefault();
+        setFormLoading(true);
+        setMessage('');
+
+        if (!situation || !mood || !negativeThought) {
+            setMessage('状況、気分、ネガティブ思考は必須項目です。');
+            setFormLoading(false);
+            return;
+        }
+
+        try {
+            const customData = customFields.reduce((acc, field) => {
+                if (field.name && field.value) {
+                    acc[`custom_${field.name}`] = field.value;
+                }
+                return acc;
+            }, {});
+            
+            await addDoc(collection(db, `artifacts/${appId}/users/${userId}/cbtEntries`), {
+                timestamp: new Date(),
+                situation,
+                mood,
+                rating,
+                negativeThought,
+                evidenceFor,
+                evidenceAgainst,
+                balancedThought: balancedThought || generatedBalancedThought,
+                ...customData,
+            });
+            setMessage('思考記録を保存しました！');
+            setSituation('');
+            setMood('');
+            setRating(3);
+            setNegativeThought('');
+            setEvidenceFor('');
+            setEvidenceAgainst('');
+            setBalancedThought('');
+            setGeneratedBalancedThought(''); // Clear generated thought after saving
+            setCustomFields([]);
+        } catch (error) {
+            console.error("Failed to add document: ", error);
+            setMessage('保存に失敗しました。もう一度お試しください。');
+        } finally {
+            setFormLoading(false);
+        }
+    };
+    
+    // Handle entry deletion
+    const handleDelete = async (id) => {
+        if (!window.confirm('この記録を削除してもよろしいですか？')) return;
+        try {
+            await deleteDoc(doc(db, `artifacts/${appId}/users/${userId}/cbtEntries`, id));
+            setMessage('記録を削除しました。');
+        } catch (error) {
+            console.error("Failed to delete document: ", error);
+            setMessage('削除に失敗しました。');
+        }
+    };
+    
+    const handleAddCustomField = () => {
+        setCustomFields([...customFields, { id: Date.now(), name: '', value: '' }]);
+    };
+    
+    const handleRemoveCustomField = (id) => {
+        setCustomFields(customFields.filter(field => field.id !== id));
+    };
+
+    const handleCustomFieldChange = (id, fieldName, value) => {
+        setCustomFields(customFields.map(field => 
+            field.id === id ? { ...field, [fieldName]: value } : field
+        ));
+    };
+    
+    // Function to add dummy entries for testing
+    const handleAddDummyEntries = async () => {
+        if (!db || !userId) {
+            setMessage('データベースが初期化されていません。');
+            return;
+        }
+
+        setFormLoading(true);
+        setMessage('テストデータを追加中...');
+
+        const dummyEntries = [
+            { situation: '朝の通勤電車が遅れた', mood: 'イライラ', rating: 2, negativeThought: '今日は最悪な日になりそうだ', evidenceFor: '電車が遅れて会議に間に合わないかもしれない', evidenceAgainst: '会議はまだ始まっていないし、連絡はしてある', balancedThought: '電車の遅延は自分のせいじゃない。落ち着いて今できることに集中しよう。', custom_睡眠時間: '6時間', custom_運動: 'なし'},
+            { situation: '上司から厳しいフィードバックを受けた', mood: '落ち込み', rating: 1, negativeThought: '自分は仕事ができない人間だ', evidenceFor: '上司は具体的な改善点をいくつも指摘した', evidenceAgainst: '上司は私の成長を期待してアドバイスをくれた。他のプロジェクトでは成功もしている。', balancedThought: 'フィードバックは成長の機会。改善点を明確にして、次につなげよう。', custom_睡眠時間: '7時間', custom_運動: 'ウォーキング'},
+            { situation: '友人からのメッセージに返信が来ない', mood: '不安', rating: 2, negativeThought: '私、何か悪いこと言ったかな？嫌われたのかもしれない。', evidenceFor: '最後のメッセージから数時間経っている', evidenceAgainst: '友人はただ忙しいだけかもしれないし、返信が遅いことはよくある。', balancedThought: '相手の状況を勝手に想像して不安になるのはやめよう。気長に待ってみよう。', custom_睡眠時間: '8時間', custom_運動: 'なし'},
+            { situation: 'プレゼンテーションで緊張して言葉に詰まった', mood: '恥ずかしい', rating: 2, negativeThought: 'みんなにバカにされたに違いない。完璧にできなかった。', evidenceFor: '何度か言葉に詰まった瞬間があった', evidenceAgainst: '参加者は真剣に話を聞いてくれていたし、発表後の質問も多くて興味を持ってくれたようだった。', balancedThought: '完璧でなくても、伝えたいことは伝わったはず。次回はもっと準備して臨もう。', custom_睡眠時間: '6時間', custom_運動: 'なし'},
+            { situation: '休日に特に何も予定がない', mood: '退屈', rating: 3, negativeThought: '自分はつまらない人間だから、誰も誘ってくれないんだ', evidenceFor: '特に誘いの連絡はない', evidenceAgainst: '自分で誘うこともできるし、一人で楽しめる趣味もたくさんある。', balancedThought: '誰かに頼るのではなく、自分で時間を有意義に使う方法を見つけよう。', custom_睡眠時間: '7時間', custom_運動: 'ジョギング'},
+            { situation: '健康診断の結果で少し気になる項目があった', mood: '心配', rating: 2, negativeThought: '深刻な病気かもしれない', evidenceFor: '基準値から少し外れていた', evidenceAgainst: 'まだ精密検査が必要なレベルではない。専門医のアドバイスをきちんと聞こう。', balancedThought: '必要以上に不安になるのはやめて、冷静に次のステップを考えよう。', custom_睡眠時間: '7時間', custom_運動: 'なし'},
+            { situation: '新しいことに挑戦しようとしている', mood: '興奮', rating: 5, negativeThought: '', evidenceFor: '', evidenceAgainst: '', balancedThought: '', custom_睡眠時間: '8時間', custom_運動: '筋トレ'},
+            { situation: '仕事で小さなミスをしてしまった', mood: '後悔', rating: 1, negativeThought: 'またやってしまった。どうしてこんな簡単なこともできないんだろう。', evidenceFor: 'ミスをしたという事実がある', evidenceAgainst: '誰もがミスをする。このミスから学んで、次に活かせばいい。', balancedThought: 'このミスを教訓に、次はどうすれば防げるか考えよう。', custom_睡眠時間: '5時間', custom_運動: 'なし'},
+            { situation: 'カフェで注文を間違えられた', mood: '不満', rating: 2, negativeThought: '店員さんは私のことを聞いていなかったんだ', evidenceFor: '注文したものと違うものが来た', evidenceAgainst: '忙しい時間帯だった。単なる間違いかもしれない。', balancedThought: '丁寧に伝えれば良いだけのこと。落ち着いて伝え直そう。', custom_睡眠時間: '7時間', custom_運動: 'なし'},
+            { situation: '友人との会話で話が合わなかった', mood: '孤独', rating: 2, negativeThought: 'この人とはもう分かり合えないな', evidenceFor: '話のテンポがずれたり、意見が食い違ったりした', evidenceAgainst: '違う意見を持つことは悪いことじゃない。むしろ新しい発見があるかも。', balancedThought: '意見が違うのは当たり前。相手の考えを尊重しよう。', custom_睡眠時間: '6時間', custom_運動: 'なし'},
+            { situation: '新しい趣味を始めたが、なかなか上達しない', mood: '焦り', rating: 3, negativeThought: 'センスがないから向いていないんだ', evidenceFor: '周りの人より進歩が遅い気がする', evidenceAgainst: '始めたばかりなんだから当たり前。楽しむことが一番大切。', balancedThought: 'すぐに結果を求めず、過程を楽しもう。継続は力なり。', custom_睡眠時間: '8時間', custom_運動: 'ウォーキング'},
+            { situation: '仕事の締め切りが迫っている', mood: 'ストレス', rating: 1, negativeThought: '間に合わないかもしれない。もう無理だ。', evidenceFor: 'まだタスクがたくさん残っている', evidenceAgainst: '計画を立て直せばまだ間に合う可能性はある。パニックになっても何も解決しない。', balancedThought: '一つずつタスクを分解して、着実に進めていこう。', custom_睡眠時間: '5時間', custom_運動: 'なし'},
+            { situation: '街中で知人を見かけたが、気づかれなかった', mood: '悲しい', rating: 2, negativeThought: '無視された。私はどうでもいい存在なんだ。', evidenceFor: '挨拶したが、相手は素通りしたように見えた', evidenceAgainst: 'もしかしたら相手は私に気づかなかっただけかもしれない。', balancedThought: '相手の行動の真意はわからない。安易に結論を出さないようにしよう。', custom_睡眠時間: '6時間', custom_運動: 'なし'},
+            { situation: '体重が増えてしまった', mood: '自己嫌悪', rating: 1, negativeThought: '自己管理ができない。だらしない人間だ。', evidenceFor: '体重計の数字が増えていた', evidenceAgainst: '今日からでも食生活や運動を見直せばいい。完璧を求めすぎない。', balancedThought: '自分を責めるのではなく、どうすれば改善できるか建設的に考えよう。', custom_睡眠時間: '7時間', custom_運動: 'ジョギング'},
+            { situation: '友人がSNSで旅行の写真をたくさん投稿している', mood: '羨ましい', rating: 2, negativeThought: 'みんな楽しそうでいいな。自分だけ置いていかれているみたいだ。', evidenceFor: 'SNSは切り取られた幸せな部分。それぞれの人生にそれぞれの良さがある。', evidenceAgainst: 'SNSは切り取られた幸せな部分。それぞれの人生にそれぞれの良さがある。', balancedThought: '自分にとっての幸せは何か、自分のペースで探してみよう。', custom_睡眠時間: '8時間', custom_運動: '筋トレ'},
+            { situation: '新しい家電製品の使い方がわからない', mood: '無力感', rating: 2, negativeThought: '自分は本当に機械に弱い。こんなことも理解できないなんて。', evidenceFor: '説明書を読んでもよくわからない', evidenceAgainst: '誰もが初めてはわからないもの。動画を見たり、サポートに連絡したりする方法がある。', balancedThought: 'わからないことは恥ずかしいことじゃない。一つずつ試して解決していこう。', custom_睡眠時間: '7時間', custom_運動: 'なし'},
+            { situation: '公共の場で子供が騒いでいるのを見た', mood: '平静', rating: 3, negativeThought: '', evidenceFor: '', evidenceAgainst: '', balancedThought: '', custom_睡眠時間: '6時間', custom_運動: 'なし'},
+            { situation: '朝、寝坊してしまった', mood: '焦り', rating: 2, negativeThought: 'もう一日台無しだ。', evidenceFor: '予定より遅く起きた', evidenceAgainst: 'まだ時間はたっぷりある。寝坊したからといって一日が台無しになるわけではない。', balancedThought: '切り替えて、今日一日をどう過ごすか考えよう。', custom_睡眠時間: '4時間', custom_運動: 'なし'},
+            { situation: '雨が降ってきた', mood: 'がっかり', rating: 3, negativeThought: 'せっかくの予定が台無しだ。', evidenceFor: '外出しようとしたら雨が降ってきた', evidenceAgainst: '雨の日だからこそ楽しめることもある。読書をしたり、映画を観たりできる。', balancedThought: '雨の日の楽しみ方を見つけて、気分を切り替えよう。', custom_睡眠時間: '7時間', custom_運動: 'なし'},
+            { situation: '夕食に何を作るか悩んでいる', mood: '迷い', rating: 3, negativeThought: '料理が苦手だから何を作っても美味しくないだろう。', evidenceFor: '料理のレパートリーが少ない', evidenceAgainst: '簡単なレシピでも美味しく作れるものはたくさんある。', balancedThought: '新しいレシピに挑戦してみる良い機会だ。', custom_睡眠時間: '8時間', custom_運動: 'ウォーキング'}
+        ];
+
+        const entriesCollection = collection(db, `artifacts/${appId}/users/${userId}/cbtEntries`);
+
+        for (const entry of dummyEntries) {
+            const randomDays = Math.floor(Math.random() * 60);
+            const timestamp = new Date();
+            timestamp.setDate(timestamp.getDate() - randomDays);
+
+            await addDoc(entriesCollection, { ...entry, timestamp });
+        }
+
+        setMessage('テストデータを20件追加しました！');
+        setFormLoading(false);
+    };
+
+    // Gemini API call for generating balanced thought
+    const handleAnalyzeThought = async () => {
+        if (!situation || !negativeThought) {
+            setMessage('状況とネガティブ思考を入力してください。');
+            return;
+        }
+
+        setApiLoading(true);
+        setGeneratedBalancedThought('');
+        setMessage('Geminiが思考を分析中です...');
+
+        const prompt = `以下の状況とネガティブ思考に対して、認知行動療法（CBT）に基づいた、よりバランスの取れた思考を提案してください。
+        
+        状況: ${situation}
+        ネガティブ思考: ${negativeThought}
+        
+        返答は、提案されたバランスの取れた思考のみを簡潔に、日本語で記述してください。`;
+
+        try {
+            const apiKey = "";
+            const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key=${apiKey}`;
+            
+            let chatHistory = [];
+            chatHistory.push({ role: "user", parts: [{ text: prompt }] });
+            const payload = { contents: chatHistory };
+            
+            const response = await fetch(apiUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+
+            const result = await response.json();
+            
+            if (result.candidates && result.candidates.length > 0 && result.candidates[0].content && result.candidates[0].content.parts && result.candidates[0].content.parts.length > 0) {
+                const text = result.candidates[0].content.parts[0].text;
+                setGeneratedBalancedThought(text);
+                setMessage('バランスの取れた思考が提案されました！');
+            } else {
+                setMessage('分析に失敗しました。もう一度お試しください。');
+            }
+        } catch (error) {
+            console.error("Gemini API Error:", error);
+            setMessage('分析中にエラーが発生しました。');
+        } finally {
+            setApiLoading(false);
+        }
+    };
+    
+    // Gemini API call for summarizing all entries
+    const handleSummarizeEntries = async () => {
+        if (entries.length === 0) {
+            setMessage('要約するには記録がありません。');
+            return;
+        }
+        
+        setAnalysisLoading(true);
+        setSummaryResult('');
+        setMessage('Geminiが記録全体を要約中です...');
+
+        const entryText = entries.map(entry => 
+            `日付: ${formatDate(entry.timestamp)}\n状況: ${entry.situation}\n気分: ${entry.mood}\nネガティブ思考: ${entry.negativeThought}\n`
+        ).join('\n---\n');
+
+        const prompt = `以下の自己管理ノートの記録を読んで、ユーザーの最近の気分の傾向、よく現れるネガティブ思考のパターン、そしてそれらを改善するための簡単なヒントを日本語で簡潔に要約してください。
+        
+        記録:\n${entryText}`;
+        
+        try {
+            const apiKey = "";
+            const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key=${apiKey}`;
+            
+            let chatHistory = [];
+            chatHistory.push({ role: "user", parts: [{ text: prompt }] });
+            const payload = { contents: chatHistory };
+            
+            const response = await fetch(apiUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+
+            const result = await response.json();
+            
+            if (result.candidates && result.candidates.length > 0 && result.candidates[0].content && result.candidates[0].content.parts && result.candidates[0].content.parts.length > 0) {
+                const text = result.candidates[0].content.parts[0].text;
+                setSummaryResult(text);
+                setMessage('記録の要約が完了しました！');
+            } else {
+                setMessage('要約に失敗しました。もう一度お試しください。');
+            }
+        } catch (error) {
+            console.error("Gemini API Error:", error);
+            setMessage('要約中にエラーが発生しました。');
+        } finally {
+            setAnalysisLoading(false);
+        }
+    };
+
+    // Render the journal entry form
+    const renderJournalForm = () => (
+        <div className="p-6 bg-white rounded-xl shadow-lg border border-gray-200">
+            <h2 className="text-2xl font-bold text-gray-800 mb-4">今日の思考記録</h2>
+            <form onSubmit={handleSubmit} className="space-y-4">
+                <div>
+                    <label htmlFor="situation" className="block text-sm font-medium text-gray-700">状況</label>
+                    <textarea
+                        id="situation"
+                        value={situation}
+                        onChange={(e) => { setSituation(e.target.value); setGeneratedBalancedThought(''); }}
+                        placeholder="何が起こりましたか？ (例: 友人にメールを送ったが返信がない)"
+                        className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm p-2 h-24"
+                        required
+                    ></textarea>
+                </div>
+                <div>
+                    <label htmlFor="mood" className="block text-sm font-medium text-gray-700">気分</label>
+                    <input
+                        id="mood"
+                        type="text"
+                        value={mood}
+                        onChange={(e) => setMood(e.target.value)}
+                        placeholder="その時どんな気分でしたか？ (例: 不安、悲しい)"
+                        className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm p-2"
+                        list="mood-suggestions"
+                        required
+                    />
+                    <datalist id="mood-suggestions">
+                        {moodSuggestions.map(suggestion => (
+                            <option key={suggestion} value={suggestion} />
+                        ))}
+                    </datalist>
+                </div>
+                <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-2">気分の評価 (1:最悪 - 5:最高)</label>
+                    <div className="flex justify-between items-center bg-gray-50 p-2 rounded-md">
+                        {[1, 2, 3, 4, 5].map((value) => (
+                            <label key={value} className="flex flex-col items-center">
+                                <input
+                                    type="radio"
+                                    name="rating"
+                                    value={value}
+                                    checked={rating === value}
+                                    onChange={() => setRating(value)}
+                                    className="h-4 w-4 text-indigo-600 focus:ring-indigo-500 border-gray-300"
+                                />
+                                <span className="text-xs mt-1">{value}</span>
+                            </label>
+                        ))}
+                    </div>
+                </div>
+                <div>
+                    <label htmlFor="negativeThought" className="block text-sm font-medium text-gray-700">ネガティブ思考</label>
+                    <textarea
+                        id="negativeThought"
+                        value={negativeThought}
+                        onChange={(e) => { setNegativeThought(e.target.value); setGeneratedBalancedThought(''); }}
+                        placeholder="頭に浮かんだ思考は？ (例: 嫌われたのかも、自分はダメだ)"
+                        className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm p-2 h-24"
+                        required
+                    ></textarea>
+                </div>
+                <div className="border-t pt-4">
+                    <h3 className="text-lg font-semibold text-gray-800 mb-2">思考のバランスを見つける</h3>
+                    <p className="text-sm text-gray-600 mb-4">ネガティブな思考を客観的に見つめ直してみましょう。</p>
+                    <div className="flex space-x-2 mb-4">
+                        <button
+                            type="button"
+                            onClick={handleAnalyzeThought}
+                            disabled={apiLoading || !situation || !negativeThought}
+                            className="flex-1 bg-violet-600 text-white py-2 px-4 rounded-md hover:bg-violet-700 focus:outline-none focus:ring-2 focus:ring-violet-500 focus:ring-offset-2 transition-colors duration-200"
+                        >
+                            {apiLoading ? '分析中...' : '✨ 思考を分析 ✨'}
+                        </button>
+                    </div>
+                    <div>
+                        <label htmlFor="balancedThought" className="block text-sm font-medium text-gray-700">よりバランスの取れた思考</label>
+                        <textarea
+                            id="balancedThought"
+                            value={balancedThought || generatedBalancedThought}
+                            onChange={(e) => setBalancedThought(e.target.value)}
+                            placeholder="両方の証拠を考慮して、新しい考え方を見つけましょう。"
+                            className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm p-2 h-24"
+                        ></textarea>
+                    </div>
+                </div>
+                <div className="border-t pt-4 space-y-2">
+                    <div className="flex justify-between items-center">
+                        <h3 className="text-lg font-semibold text-gray-800">カスタム項目</h3>
+                        <button
+                            type="button"
+                            onClick={handleAddCustomField}
+                            className="text-indigo-600 hover:text-indigo-800 transition-colors duration-200"
+                        >
+                            + 追加
+                        </button>
+                    </div>
+                    {customFields.map((field, index) => (
+                        <div key={field.id} className="flex space-x-2 items-center">
+                            <input
+                                type="text"
+                                value={field.name}
+                                onChange={(e) => handleCustomFieldChange(field.id, 'name', e.target.value)}
+                                placeholder="項目名"
+                                className="w-1/3 rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm p-2"
+                                list={`custom-name-suggestions-${index}`}
+                            />
+                            <datalist id={`custom-name-suggestions-${index}`}>
+                                {Object.keys(customSuggestions).map(name => (
+                                    <option key={name} value={name} />
+                                ))}
+                            </datalist>
+                            <input
+                                type="text"
+                                value={field.value}
+                                onChange={(e) => handleCustomFieldChange(field.id, 'value', e.target.value)}
+                                placeholder="内容"
+                                className="w-2/3 rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm p-2"
+                                list={`custom-value-suggestions-${index}`}
+                            />
+                            <datalist id={`custom-value-suggestions-${index}`}>
+                                {customSuggestions[field.name]?.map(value => (
+                                    <option key={value} value={value} />
+                                ))}
+                            </datalist>
+                            <button
+                                type="button"
+                                onClick={() => handleRemoveCustomField(field.id)}
+                                className="text-red-500 hover:text-red-700 transition-colors duration-200"
+                            >
+                                <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+                                    <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" clipRule="evenodd" />
+                                </svg>
+                            </button>
+                        </div>
+                    ))}
+                </div>
+                <button
+                    type="submit"
+                    className="w-full bg-indigo-600 text-white py-2 px-4 rounded-md hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2 transition-colors duration-200"
+                    disabled={formLoading || apiLoading}
+                >
+                    {formLoading ? '保存中...' : '記録を保存'}
+                </button>
+                {message && (
+                    <div className="mt-2 text-center text-sm text-green-600">
+                        {message}
+                    </div>
+                )}
+            </form>
+        </div>
+    );
+
+    // Render the dashboard with past entries
+    const renderDashboard = () => (
+        <div className="p-6 bg-white rounded-xl shadow-lg border border-gray-200">
+            <h2 className="text-2xl font-bold text-gray-800 mb-4">過去の思考記録</h2>
+            {loading ? (
+                <div className="text-center text-gray-500">記録を読み込み中...</div>
+            ) : entries.length === 0 ? (
+                <div className="text-center text-gray-500">まだ記録がありません。</div>
+            ) : (
+                <div className="space-y-4">
+                    {entries.map((entry) => (
+                        <div key={entry.id} className="p-4 border border-gray-200 rounded-lg bg-gray-50 relative">
+                            <div className="flex justify-between items-start">
+                                <h3 className="text-lg font-semibold text-gray-900">{formatDate(entry.timestamp)}</h3>
+                                <button
+                                    onClick={() => handleDelete(entry.id)}
+                                    className="text-red-500 hover:text-red-700 transition-colors duration-200 absolute top-2 right-2"
+                                    aria-label="記録を削除"
+                                >
+                                    <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+                                        <path fillRule="evenodd" d="M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zM7 8a1 1 0 012 0v6a1 1 0 11-2 0V8zm5-1a1 1 0 00-1 1v6a1 1 0 102 0V8a1 1 0 00-1-1z" clipRule="evenodd" />
+                                    </svg>
+                                </button>
+                            </div>
+                            <p className="text-gray-700 mt-2">
+                                <span className="font-medium">状況: </span>{entry.situation}
+                            </p>
+                            <p className="text-gray-700">
+                                <span className="font-medium">気分: </span>{entry.mood}
+                                <span className="ml-2 text-yellow-500 font-bold">
+                                    {entry.rating ? '★'.repeat(entry.rating) + '☆'.repeat(5 - entry.rating) : '評価なし'}
+                                </span>
+                            </p>
+                            <p className="text-gray-700">
+                                <span className="font-medium">ネガティブ思考: </span>{entry.negativeThought}
+                            </p>
+                            <p className="text-gray-700">
+                                <span className="font-medium">思考を支持する証拠: </span>{entry.evidenceFor || 'なし'}
+                            </p>
+                            <p className="text-gray-700">
+                                <span className="font-medium">思考に反する証拠: </span>{entry.evidenceAgainst || 'なし'}
+                            </p>
+                            <p className="text-gray-700">
+                                <span className="font-medium">バランスの取れた思考: </span>{entry.balancedThought || 'なし'}
+                            </p>
+                            {Object.entries(entry)
+                                .filter(([key, value]) => key.startsWith('custom_') && value)
+                                .map(([key, value]) => (
+                                    <p key={key} className="text-gray-700">
+                                        <span className="font-medium">{key.replace('custom_', '')}: </span>{value}
+                                    </p>
+                                ))
+                            }
+                        </div>
+                    ))}
+                </div>
+            )}
+        </div>
+    );
+
+    // Render the analytics view
+    const renderAnalytics = () => {
+        // Simple analysis logic
+        const totalEntries = entries.length;
+        const moodCounts = entries.reduce((acc, entry) => {
+            const mood = entry.mood || '不明';
+            acc[mood] = (acc[mood] || 0) + 1;
+            return acc;
+        }, {});
+        
+        // Data for the chart
+        const chartData = entries.map(entry => ({
+            name: formatDate(entry.timestamp).substring(0, formatDate(entry.timestamp).indexOf('曜日') + 1), // Only date and weekday for X-axis
+            rating: entry.rating || 0
+        })).reverse(); // Reverse for chronological order on the chart
+
+        const CustomTooltip = ({ active, payload, label }) => {
+            if (active && payload && payload.length) {
+              return (
+                <div className="bg-white p-2 border border-gray-300 rounded shadow-md text-sm">
+                  <p className="font-bold">{`日付: ${label}`}</p>
+                  <p className="text-indigo-600">{`気分評価: ${payload[0].value}`}</p>
+                </div>
+              );
+            }
+            return null;
+        };
+
+        const renderCustomTick = ({ x, y, payload }) => {
+            const formattedDate = payload.value.split(' ')[0]; // Split to show only date without weekday
+            return (
+              <g transform={`translate(${x},${y})`}>
+                <text x={0} y={0} dy={16} textAnchor="middle" fill="#666" fontSize={10}>{formattedDate}</text>
+              </g>
+            );
+          };
+        
+        return (
+            <div className="p-6 bg-white rounded-xl shadow-lg border border-gray-200 space-y-6">
+                <h2 className="text-2xl font-bold text-gray-800">記録の分析</h2>
+                
+                {/* Gemini API button for summary */}
+                <div className="flex justify-center">
+                    <button
+                        onClick={handleSummarizeEntries}
+                        disabled={analysisLoading || entries.length === 0}
+                        className="bg-violet-600 text-white py-2 px-6 rounded-lg font-medium hover:bg-violet-700 transition-colors duration-200"
+                    >
+                        {analysisLoading ? '要約中...' : '✨ 記録を要約 ✨'}
+                    </button>
+                </div>
+                
+                {/* Summary result display */}
+                {summaryResult && (
+                    <div className="bg-gray-50 p-4 rounded-lg shadow-sm border border-gray-200 whitespace-pre-wrap">
+                        {summaryResult}
+                    </div>
+                )}
+                
+                <div className="space-y-4">
+                    <h3 className="text-xl font-semibold text-gray-800">記録の概要</h3>
+                    <p className="text-gray-700">これまでの記録総数: **{totalEntries}** 件</p>
+                    <div className="text-gray-700">
+                        記録された気分の傾向:
+                        <ul className="list-disc list-inside mt-2 space-y-1">
+                            {Object.entries(moodCounts).map(([mood, count]) => (
+                                <li key={mood}>**{mood}**: {count}回</li>
+                            ))}
+                        </ul>
+                    </div>
+                </div>
+                
+                {/* Mood Rating Chart */}
+                {entries.length > 1 && (
+                    <div className="border-t pt-6 space-y-4">
+                        <h3 className="text-xl font-semibold text-gray-800">気分の推移グラフ</h3>
+                        <div className="w-full h-80">
+                            <ResponsiveContainer width="100%" height="100%">
+                                <LineChart
+                                    width={500}
+                                    height={300}
+                                    data={chartData}
+                                    margin={{
+                                        top: 5,
+                                        right: 30,
+                                        left: 20,
+                                        bottom: 25,
+                                    }}
+                                >
+                                    <CartesianGrid strokeDasharray="3 3" />
+                                    <XAxis 
+                                        dataKey="name"
+                                        interval="preserveStartEnd"
+                                        angle={-45}
+                                        textAnchor="end"
+                                        height={60}
+                                        tick={{ fontSize: 10 }}
+                                        tickFormatter={(value) => value.split(' ')[0]} // Only show date
+                                    />
+                                    <YAxis 
+                                        domain={[0, 5]}
+                                        ticks={[1, 2, 3, 4, 5]}
+                                        label={{ value: '気分評価', angle: -90, position: 'insideLeft' }}
+                                    />
+                                    <Tooltip content={<CustomTooltip />} />
+                                    <Line type="monotone" dataKey="rating" stroke="#8884d8" activeDot={{ r: 8 }} />
+                                </LineChart>
+                            </ResponsiveContainer>
+                        </div>
+                    </div>
+                )}
+            </div>
+        );
+    };
+
+    // Main layout and navigation
+    return (
+        <div className="font-sans bg-gray-100 min-h-screen p-4 sm:p-8 flex flex-col items-center">
+            <div className="w-full max-w-4xl space-y-8">
+                <header className="bg-white rounded-xl shadow-lg p-6 flex flex-col sm:flex-row justify-between items-center space-y-4 sm:space-y-0">
+                    <h1 className="text-3xl font-extrabold text-indigo-700">自己管理ノート</h1>
+                    <nav className="flex space-x-2 sm:space-x-4">
+                        <button
+                            onClick={() => setCurrentView('home')}
+                            className={`px-4 py-2 rounded-lg text-sm font-semibold transition-colors duration-200 ${currentView === 'home' ? 'bg-indigo-600 text-white shadow-md' : 'text-indigo-600 hover:bg-indigo-100'}`}
+                        >
+                            ホーム
+                        </button>
+                        <button
+                            onClick={() => setCurrentView('journal')}
+                            className={`px-4 py-2 rounded-lg text-sm font-semibold transition-colors duration-200 ${currentView === 'journal' ? 'bg-indigo-600 text-white shadow-md' : 'text-indigo-600 hover:bg-indigo-100'}`}
+                        >
+                            思考記録
+                        </button>
+                        <button
+                            onClick={() => setCurrentView('dashboard')}
+                            className={`px-4 py-2 rounded-lg text-sm font-semibold transition-colors duration-200 ${currentView === 'dashboard' ? 'bg-indigo-600 text-white shadow-md' : 'text-indigo-600 hover:bg-indigo-100'}`}
+                        >
+                            記録を見る
+                        </button>
+                        <button
+                            onClick={() => setCurrentView('analytics')}
+                            className={`px-4 py-2 rounded-lg text-sm font-semibold transition-colors duration-200 ${currentView === 'analytics' ? 'bg-indigo-600 text-white shadow-md' : 'text-indigo-600 hover:bg-indigo-100'}`}
+                        >
+                            分析
+                        </button>
+                    </nav>
+                </header>
+
+                <main>
+                    {(() => {
+                        switch (currentView) {
+                            case 'journal':
+                                return renderJournalForm();
+                            case 'dashboard':
+                                return renderDashboard();
+                            case 'analytics':
+                                return renderAnalytics();
+                            default:
+                                return (
+                                    <div className="bg-white rounded-xl shadow-lg p-6 border border-gray-200 text-gray-700 space-y-4">
+                                        <h2 className="text-2xl font-bold text-gray-800">アプリの使い方</h2>
+                                        <p>このアプリは、**自己管理**と**認知行動療法（CBT）**の考え方を使って、日々の出来事や心の状態を整理するのを助けます。</p>
+                                        <p>「思考記録」では、ネガティブな気持ちになった時の**状況**、**気分**、**思考**を記録します。そして、その思考を客観的に見つめ直し、**より現実的でバランスの取れた考え方**を見つける手助けをします。</p>
+                                        <p>「記録を見る」では、これまでの記録を振り返ることができます。「分析」タブでは、記録をまとめて振り返ることで、自分自身の傾向を理解する手助けをします。</p>
+                                        <p className="mt-4">
+                                            **ユーザーID**: <code className="bg-gray-200 p-1 rounded text-sm break-all">{userId || '読み込み中...'}</code>
+                                        </p>
+                                        <button
+                                            onClick={handleAddDummyEntries}
+                                            disabled={formLoading || loading}
+                                            className="w-full bg-gray-200 text-gray-800 py-2 px-4 rounded-md hover:bg-gray-300 focus:outline-none focus:ring-2 focus:ring-gray-400 focus:ring-offset-2 transition-colors duration-200"
+                                        >
+                                            テストデータを追加
+                                        </button>
+                                    </div>
+                                );
+                        }
+                    })()}
+                </main>
+            </div>
+        </div>
+    );
+}
